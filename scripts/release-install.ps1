@@ -25,6 +25,8 @@ function Install-DearMachineRelease {
     $verified = $false
     if (!$gh) {
       if (!(Confirm-Unverified 'missing')) { return }
+    } elseif (!(Test-GhSupported $gh.Source)) {
+      if (!(Confirm-Unverified 'outdated')) { return }
     } elseif ((Invoke-Native $gh.Source @('auth', 'status')).Status -ne 0) {
       if (!(Confirm-Unverified 'signed-out')) { return }
     } else {
@@ -97,6 +99,14 @@ function Invoke-Native([string]$Program, [string[]]$Arguments) {
   } finally { $ErrorActionPreference = $previous }
 }
 
+# gh 2.68.0 is the oldest release with --source-ref that also reads the
+# current Sigstore trusted root.
+function Test-GhSupported([string]$Program) {
+  $version = Invoke-Native $Program @('--version')
+  if ($version.Status -ne 0 -or "$($version.Output)" -notmatch 'gh version (\d+)\.(\d+)\.') { return $false }
+  return ([int]$Matches[1] -gt 2) -or ([int]$Matches[1] -eq 2 -and [int]$Matches[2] -ge 68)
+}
+
 function Get-ReleaseFile([string]$BaseUrl, [string]$Name, [string]$Directory) {
   $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
   & $curl -q --fail --location --proto-redir '=https' --connect-timeout 30 --retry 2 --silent --show-error `
@@ -129,6 +139,13 @@ function Confirm-Unverified([string]$Reason) {
       '  1. Install gh: winget install --id GitHub.cli',
       '     (or follow https://cli.github.com), then open a new PowerShell window',
       '  2. Sign in with: gh auth login',
+      '  3. Run this installer again.')
+  } elseif ($Reason -eq 'outdated') {
+    $why = "It uses GitHub's gh tool for that check, and the gh on this computer is too old to do it. Version 2.68.0 or newer is needed."
+    $steps = @(
+      '  1. Update gh: winget upgrade --id GitHub.cli',
+      '     (or follow https://cli.github.com), then open a new PowerShell window',
+      "  2. Sign in if you haven't yet: gh auth login",
       '  3. Run this installer again.')
   } else {
     $why = "It uses GitHub's gh tool for that check. gh is installed, but it isn't signed in to GitHub yet."

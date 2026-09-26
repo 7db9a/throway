@@ -48,6 +48,9 @@ main() {
   if ! command -v gh >/dev/null 2>&1; then
     confirm_unverified missing
     verified=false
+  elif ! gh_supported; then
+    confirm_unverified outdated
+    verified=false
   elif ! gh auth status >/dev/null 2>&1; then
     confirm_unverified signed-out
     verified=false
@@ -89,6 +92,15 @@ main() {
   sh "$work/$bootstrap" "$work/$archive"
 }
 
+# gh 2.68.0 is the oldest release with --source-ref that also reads the
+# current Sigstore trusted root.
+gh_supported() {
+  gh --version 2>/dev/null | awk 'NR == 1 {
+    split($3, v, ".")
+    exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 68))
+  }'
+}
+
 fetch() {
   curl --fail --silent --show-error --location --proto-redir '=https' --retry 2 \
     --connect-timeout 30 --output "$work/$1" "$download_url/$1" ||
@@ -99,8 +111,14 @@ confirm_unverified() {
   if [ "$1" = missing ]; then
     reason="It uses GitHub's free gh tool for that check, and gh isn't installed on this computer."
     steps="  1. Install gh by following https://cli.github.com
-       (for example: brew install gh, or sudo apt install gh)
+       (on a Mac with Homebrew: brew install gh)
   2. Sign in with: gh auth login
+  3. Run this installer again."
+  elif [ "$1" = outdated ]; then
+    reason="It uses GitHub's gh tool for that check, and the gh on this computer is too old to do it. Version 2.68.0 or newer is needed."
+    steps="  1. Update gh by following https://cli.github.com
+       (on a Mac with Homebrew: brew upgrade gh)
+  2. Sign in if you haven't yet: gh auth login
   3. Run this installer again."
   else
     reason="It uses GitHub's gh tool for that check. gh is installed, but it isn't signed in to GitHub yet."
