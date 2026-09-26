@@ -36,7 +36,8 @@ jobs:
       - name: Signed-out gh verifies with the published bundle
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
+          # Capture native stderr as text instead of stopping on it.
+          $ErrorActionPreference = 'Continue'
           Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
           Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
           & gh auth status *> $null
