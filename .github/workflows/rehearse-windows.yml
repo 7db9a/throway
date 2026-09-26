@@ -36,6 +36,8 @@ jobs:
       - name: Missing gh without a terminal installs nothing
         shell: powershell
         run: |
+          # Capture the child's stderr as text instead of stopping on it.
+          $ErrorActionPreference = 'Continue'
           $script = Join-Path $env:RUNNER_TEMP 'install.ps1'
           $env:PATH = ($env:PATH -split ';' | Where-Object { !(Test-Path (Join-Path $_ 'gh.exe')) }) -join ';'
           if (Get-Command gh -ErrorAction SilentlyContinue) { throw 'gh is still on PATH' }
