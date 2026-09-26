@@ -46,3 +46,5 @@ jobs:
           if ($LASTEXITCODE -eq 0) { throw 'installer should have stopped' }
           if ($output -notmatch "gh isn't installed" -or $output -notmatch 'no terminal to confirm') { throw 'unexpected message' }
           if (Test-Path (Join-Path $env:LOCALAPPDATA 'DearMachine')) { throw 'something was installed' }
+          # The installer's exit code 1 is expected; the step's own checks passed.
+          exit 0
