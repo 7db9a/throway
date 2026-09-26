@@ -21,33 +21,44 @@ function Install-DearMachineRelease {
   $work = Join-Path $cache ('r-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
   New-Item -ItemType Directory -Force -Path $work | Out-Null
   try {
+    # Signed-in gh downloads through the GitHub API, which also works while the
+    # repository is private. Otherwise files come from the public release URL.
     $gh = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue
-    $verified = $false
+    $ghProgram = if ($gh) { $gh.Source } else { $null }
+    $source = 'web'
+    $verify = $false
     if (!$gh) {
       if (!(Confirm-Unverified 'missing')) { return }
     } elseif (!(Test-GhSupported $gh.Source)) {
       if (!(Confirm-Unverified 'outdated')) { return }
-    } elseif ((Invoke-Native $gh.Source @('auth', 'status')).Status -ne 0) {
-      if (!(Confirm-Unverified 'signed-out')) { return }
     } else {
-      $verified = $true
+      $verify = $true
+      if ((Invoke-Native $gh.Source @('auth', 'status')).Status -eq 0) { $source = 'gh' }
     }
 
+    Write-Host "Downloading the checksums for Dear Machine $tag..."
+    $null = Get-ReleaseFile 'SHA256SUMS'
     $sums = Join-Path $work 'SHA256SUMS'
-    if ($verified) {
-      Write-Host "Downloading the checksums for Dear Machine $tag..."
-      & $gh.Source release download $tag --repo $repository --pattern SHA256SUMS --dir $work
-      if ($LASTEXITCODE -ne 0) { throw 'Could not download the release checksums. Check your connection and try again.' }
+    if ($verify) {
+      # The published bundle lets gh verify without signing in; it is signed,
+      # so obtaining it from the release does not weaken the check.
+      $bundleArguments = @()
+      if (Get-ReleaseFile 'attestation.sigstore.json' -Optional) {
+        $bundleArguments = @('--bundle', (Join-Path $work 'attestation.sigstore.json'))
+      } elseif ($source -ne 'gh') {
+        if (!(Confirm-Unverified 'signed-out')) { return }
+        $verify = $false
+      }
+    }
+    if ($verify) {
       Write-Host 'Checking that this release was built by the official release workflow...'
-      $check = Invoke-Native $gh.Source @('attestation', 'verify', $sums, '--repo', $repository,
-        '--signer-workflow', $signerWorkflow, '--source-ref', $sourceRef, '--deny-self-hosted-runners')
+      $check = Invoke-Native $gh.Source (@('attestation', 'verify', $sums) + $bundleArguments + @('--repo', $repository,
+        '--signer-workflow', $signerWorkflow, '--source-ref', $sourceRef, '--deny-self-hosted-runners'))
       if ($check.Status -ne 0) {
         $check.Output | Out-Host
         throw 'This release could not be verified, so nothing was installed. Please report this to the Dear Machine maintainers.'
       }
       Write-Host 'Release verified.'
-    } else {
-      Get-ReleaseFile $downloadUrl 'SHA256SUMS' $work
     }
     $expected = $null
     foreach ($line in [IO.File]::ReadAllLines($sums)) {
@@ -56,12 +67,7 @@ function Install-DearMachineRelease {
     if (!$expected) { throw "Release $tag has no download for $target yet. Nothing was installed." }
 
     Write-Host "Downloading Dear Machine $tag for $target..."
-    if ($verified) {
-      & $gh.Source release download $tag --repo $repository --pattern $archive --dir $work
-      if ($LASTEXITCODE -ne 0) { throw 'The download did not complete. Check your connection and try again.' }
-    } else {
-      Get-ReleaseFile $downloadUrl $archive $work
-    }
+    $null = Get-ReleaseFile $archive
     $zip = Join-Path $work $archive
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant() -ne $expected) {
       throw "$archive does not match the release checksums, so nothing was installed."
@@ -107,11 +113,24 @@ function Test-GhSupported([string]$Program) {
   return ([int]$Matches[1] -gt 2) -or ([int]$Matches[1] -eq 2 -and [int]$Matches[2] -ge 68)
 }
 
-function Get-ReleaseFile([string]$BaseUrl, [string]$Name, [string]$Directory) {
-  $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
-  & $curl -q --fail --location --proto-redir '=https' --connect-timeout 30 --retry 2 --silent --show-error `
-    --output (Join-Path $Directory $Name) --url "$BaseUrl/$Name"
-  if ($LASTEXITCODE -ne 0) { throw "Could not download $Name. Check your connection and try again." }
+# Download one release file into the caller's $work. With -Optional, report
+# absence as $false instead of failing.
+function Get-ReleaseFile([string]$Name, [switch]$Optional) {
+  $output = Join-Path $work $Name
+  if ($source -eq 'gh') {
+    $result = Invoke-Native $ghProgram @('release', 'download', $tag, '--repo', $repository, '--pattern', $Name, '--dir', $work)
+  } else {
+    # Check the status explicitly: some curl releases exit 0 on an HTTP error
+    # when --fail is combined with --retry.
+    $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+    $result = Invoke-Native $curl @('-q', '--silent', '--location', '--proto-redir', '=https', '--connect-timeout', '30',
+      '--write-out', '%{http_code}', '--output', $output, '--url', "$downloadUrl/$Name")
+    if ($result.Status -eq 0 -and "$($result.Output)".Trim() -ne '200') { $result.Status = 22 }
+  }
+  if ($result.Status -eq 0) { return $true }
+  if (Test-Path -LiteralPath $output) { Remove-Item -LiteralPath $output -Force }
+  if ($Optional) { return $false }
+  throw "Could not download $Name. Check your connection and try again."
 }
 
 function Expand-ReleaseZip([string]$Archive, [string]$Destination) {
@@ -138,17 +157,15 @@ function Confirm-Unverified([string]$Reason) {
     $steps = @(
       '  1. Install gh: winget install --id GitHub.cli',
       '     (or follow https://cli.github.com), then open a new PowerShell window',
-      '  2. Sign in with: gh auth login',
-      '  3. Run this installer again.')
+      '  2. Run this installer again. If it asks you to sign in, run: gh auth login')
   } elseif ($Reason -eq 'outdated') {
     $why = "It uses GitHub's gh tool for that check, and the gh on this computer is too old to do it. Version 2.68.0 or newer is needed."
     $steps = @(
       '  1. Update gh: winget upgrade --id GitHub.cli',
       '     (or follow https://cli.github.com), then open a new PowerShell window',
-      "  2. Sign in if you haven't yet: gh auth login",
-      '  3. Run this installer again.')
+      '  2. Run this installer again. If it asks you to sign in, run: gh auth login')
   } else {
-    $why = "It uses GitHub's gh tool for that check. gh is installed, but it isn't signed in to GitHub yet."
+    $why = "It uses GitHub's gh tool for that check. gh is installed, but this release can only be checked while gh is signed in to GitHub."
     $steps = @('  1. Sign in with: gh auth login', '  2. Run this installer again.')
   }
   Write-Host ''

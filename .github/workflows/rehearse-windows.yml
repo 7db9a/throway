@@ -33,6 +33,21 @@ jobs:
           Get-Content -LiteralPath $marker
           Remove-Item -Recurse -Force (Join-Path $env:LOCALAPPDATA 'DearMachine')
 
+      - name: Signed-out gh verifies with the published bundle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          & gh auth status *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'gh is unexpectedly signed in' }
+          $output = & (Join-Path $env:RUNNER_TEMP 'install.ps1') 6>&1 | Out-String
+          Write-Output $output
+          if ($output -notmatch 'Release verified' -or $output -match 'Type yes') { throw 'expected verification without a prompt' }
+          if (!(Test-Path (Join-Path $env:LOCALAPPDATA 'DearMachine\rehearsal-install.txt'))) { throw 'install-windows.ps1 was not reached' }
+          Remove-Item -Recurse -Force (Join-Path $env:LOCALAPPDATA 'DearMachine')
+          exit 0
+
       - name: Missing gh without a terminal installs nothing
         shell: powershell
         run: |

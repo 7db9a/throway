@@ -45,46 +45,51 @@ main() {
       END { if (!found) exit 1 }' "$work/SHA256SUMS"
   }
 
+  # Signed-in gh downloads through the GitHub API, which also works while the
+  # repository is private. Otherwise files come from the public release URL.
   if ! command -v gh >/dev/null 2>&1; then
     confirm_unverified missing
-    verified=false
+    source=web verify=false
   elif ! gh_supported; then
     confirm_unverified outdated
-    verified=false
-  elif ! gh auth status >/dev/null 2>&1; then
-    confirm_unverified signed-out
-    verified=false
+    source=web verify=false
+  elif gh auth status >/dev/null 2>&1; then
+    source=gh verify=true
   else
-    verified=true
+    source=web verify=true
   fi
 
-  if [ "$verified" = true ]; then
-    say "Downloading the checksums for Dear Machine $tag..."
-    gh release download "$tag" --repo "$repository" --pattern SHA256SUMS --dir "$work" ||
-      fail 'Could not download the release checksums. Check your connection and try again.'
+  say "Downloading the checksums for Dear Machine $tag..."
+  get SHA256SUMS
+  if [ "$verify" = true ]; then
+    # The published bundle lets gh verify without signing in; it is signed,
+    # so obtaining it from the release does not weaken the check.
+    if get_optional attestation.sigstore.json; then
+      set -- --bundle "$work/attestation.sigstore.json"
+    elif [ "$source" = gh ]; then
+      set --
+    else
+      confirm_unverified signed-out
+      verify=false
+    fi
+  fi
+  if [ "$verify" = true ]; then
     say 'Checking that this release was built by the official release workflow...'
-    if ! gh attestation verify "$work/SHA256SUMS" --repo "$repository" \
+    if ! gh attestation verify "$work/SHA256SUMS" "$@" --repo "$repository" \
         --signer-workflow "$signer_workflow" --source-ref "$source_ref" \
         --deny-self-hosted-runners >"$work/verification.log" 2>&1; then
       cat "$work/verification.log" >&2
       fail 'This release could not be verified, so nothing was installed. Please report this to the Dear Machine maintainers.'
     fi
     say 'Release verified.'
-  else
-    fetch SHA256SUMS
   fi
   if ! expected "$archive" >/dev/null || ! expected "$bootstrap" >/dev/null; then
     fail "Release $tag has no download for $target yet. Nothing was installed."
   fi
 
   say "Downloading Dear Machine $tag for $target..."
-  if [ "$verified" = true ]; then
-    gh release download "$tag" --repo "$repository" --pattern "$archive" --pattern "$bootstrap" --dir "$work" ||
-      fail 'The download did not complete. Check your connection and try again.'
-  else
-    fetch "$bootstrap"
-    fetch "$archive"
-  fi
+  get "$bootstrap"
+  get "$archive"
   for name in "$bootstrap" "$archive"; do
     test "$(digest "$work/$name")" = "$(expected "$name")" ||
       fail "$name does not match the release checksums, so nothing was installed."
@@ -101,10 +106,21 @@ gh_supported() {
   }'
 }
 
-fetch() {
-  curl --fail --silent --show-error --location --proto-redir '=https' --retry 2 \
-    --connect-timeout 30 --output "$work/$1" "$download_url/$1" ||
-    fail "Could not download $1. Check your connection and try again."
+# Download one release file into $work; get_optional reports absence quietly.
+get_optional() {
+  if [ "$source" = gh ]; then
+    gh release download "$tag" --repo "$repository" --pattern "$1" --dir "$work" >/dev/null 2>&1
+  else
+    # Check the status explicitly: some curl releases exit 0 on an HTTP error
+    # when --fail is combined with --retry.
+    status=$(curl --silent --location --proto-redir '=https' --connect-timeout 30 \
+      --write-out '%{http_code}' --output "$work/$1" "$download_url/$1") && [ "$status" = 200 ] ||
+      { rm -f -- "$work/$1"; return 1; }
+  fi
+}
+
+get() {
+  get_optional "$1" || fail "Could not download $1. Check your connection and try again."
 }
 
 confirm_unverified() {
@@ -112,16 +128,14 @@ confirm_unverified() {
     reason="It uses GitHub's free gh tool for that check, and gh isn't installed on this computer."
     steps="  1. Install gh by following https://cli.github.com
        (on a Mac with Homebrew: brew install gh)
-  2. Sign in with: gh auth login
-  3. Run this installer again."
+  2. Run this installer again. If it asks you to sign in, run: gh auth login"
   elif [ "$1" = outdated ]; then
     reason="It uses GitHub's gh tool for that check, and the gh on this computer is too old to do it. Version 2.68.0 or newer is needed."
     steps="  1. Update gh by following https://cli.github.com
        (on a Mac with Homebrew: brew upgrade gh)
-  2. Sign in if you haven't yet: gh auth login
-  3. Run this installer again."
+  2. Run this installer again. If it asks you to sign in, run: gh auth login"
   else
-    reason="It uses GitHub's gh tool for that check. gh is installed, but it isn't signed in to GitHub yet."
+    reason="It uses GitHub's gh tool for that check. gh is installed, but this release can only be checked while gh is signed in to GitHub."
     steps="  1. Sign in with: gh auth login
   2. Run this installer again."
   fi
