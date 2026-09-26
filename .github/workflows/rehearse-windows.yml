@@ -1,0 +1,46 @@
+# Run the published install.ps1 on Windows against a rehearsal release.
+name: Rehearse Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published rehearsal release tag
+        required: true
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  install:
+    runs-on: windows-2025
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Verified install through gh
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'install.ps1'
+          & gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern install.ps1 --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw 'download failed' }
+          & $script
+          $marker = Join-Path $env:LOCALAPPDATA 'DearMachine\rehearsal-install.txt'
+          if (!(Test-Path -LiteralPath $marker)) { throw 'install-windows.ps1 was not reached' }
+          Get-Content -LiteralPath $marker
+          Remove-Item -Recurse -Force (Join-Path $env:LOCALAPPDATA 'DearMachine')
+
+      - name: Missing gh without a terminal installs nothing
+        shell: powershell
+        run: |
+          $script = Join-Path $env:RUNNER_TEMP 'install.ps1'
+          $env:PATH = ($env:PATH -split ';' | Where-Object { !(Test-Path (Join-Path $_ 'gh.exe')) }) -join ';'
+          if (Get-Command gh -ErrorAction SilentlyContinue) { throw 'gh is still on PATH' }
+          $output = powershell -NoProfile -ExecutionPolicy Bypass -File $script 2>&1 | Out-String
+          Write-Output $output
+          if ($LASTEXITCODE -eq 0) { throw 'installer should have stopped' }
+          if ($output -notmatch "gh isn't installed" -or $output -notmatch 'no terminal to confirm') { throw 'unexpected message' }
+          if (Test-Path (Join-Path $env:LOCALAPPDATA 'DearMachine')) { throw 'something was installed' }

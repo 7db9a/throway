@@ -1,0 +1,143 @@
+# REHEARSAL copy of the Dear Machine release workflow: placeholder builds,
+# unchanged release job. Build Dear Machine release downloads and publish them as a draft GitHub
+# release with an attested SHA256SUMS. A maintainer publishes the draft.
+#
+# Pushing a v* tag builds every supported target. Run the workflow manually to
+# build a draft for a chosen tag and a subset of targets.
+#
+# While the submodules are private, add a read-only token that can read them as
+# the SUBMODULE_READ_TOKEN secret. Attestation runs only once this repository is
+# public (or on a plan that supports attestations for private repositories).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag for the draft, such as v0.1.0-rc.1
+        required: true
+      targets:
+        description: Comma-separated targets to build
+        required: true
+        default: linux-x64,windows-x64
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+        shell: python3 {0}
+        run: |
+          import json, os, re
+          # The Windows source snapshot includes nested submodules; Linux does not.
+          runners = {'linux-x64': ('ubuntu-24.04', 'false'), 'windows-x64': ('ubuntu-24.04', 'false')}
+          if os.environ['EVENT'] == 'push':
+              tag, requested = os.environ['REF_NAME'], list(runners)
+          else:
+              tag = os.environ['INPUT_TAG']
+              requested = [name.strip() for name in os.environ['INPUT_TARGETS'].split(',') if name.strip()]
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?', tag):
+              raise SystemExit(f'Invalid release tag: {tag}')
+          unknown = sorted(set(requested) - set(runners))
+          if unknown or not requested:
+              raise SystemExit('Unsupported targets: ' + ', '.join(unknown or ['(none)']))
+          matrix = [dict(target=name, runner=runners[name][0], submodules=runners[name][1])
+                    for name in runners if name in requested]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag={tag}\nmatrix={json.dumps(matrix)}\n')
+
+  build:
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Rehearsal only: tiny placeholder downloads instead of real builds.
+      - name: Build placeholder download
+        run: python3 scripts/rehearsal-build.py --target "$TARGET" --tag "$TAG" --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/dist"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+
+      - name: Render installers and checksums
+        run: |
+          dist="$RUNNER_TEMP/dist"
+          python3 scripts/render-release-installers.py --repository "$GITHUB_REPOSITORY" --tag "$TAG" --source-ref "$GITHUB_REF" --output "$dist"
+          cd "$dist"
+          find . -maxdepth 1 -type f -printf '%f\0' | sort -z | xargs -0 sha256sum -- > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest release files
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/dist/*
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTED: ${{ !github.event.repository.private }}
+        run: |
+          notes="Draft built from $GITHUB_SHA by run $GITHUB_RUN_ID."
+          if [ "$ATTESTED" != true ]; then
+            notes="$notes UNATTESTED: this repository was private when it was built. Do not publish."
+          fi
+          verify=
+          if [ "$GITHUB_REF_TYPE" = tag ]; then verify=--verify-tag; fi
+          gh release create "$TAG" --draft $verify --target "$GITHUB_SHA" --title "Dear Machine $TAG" \
+            --notes "$notes" "$RUNNER_TEMP"/dist/*
